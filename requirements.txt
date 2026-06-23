@@ -1,0 +1,11 @@
+yfinance>=0.2.40
+pandas>=2.2
+numpy>=1.26
+requests>=2.31
+scipy>=1.13
+python-dateutil>=2.9
+vaderSentiment>=3.3.2
+curl_cffi>=0.7
+# Optional, for Robinhood (unofficial, use at your own risk):
+# robin-stocks>=3.0.0
+# pyotp>=2.9

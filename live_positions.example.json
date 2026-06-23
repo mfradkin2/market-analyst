@@ -1,0 +1,4 @@
+{
+  "_comment": "Schema only — real live_positions.json is gitignored. Routines build this dict at runtime from MCP get_equity_positions + get_equity_quotes.",
+  "EXAMPLE_TICKER": {"qty": 0.0, "avg_cost": 0.0, "mkt_value": 0.0}
+}
