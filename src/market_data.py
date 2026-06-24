@@ -8,8 +8,10 @@ and sector co-movement.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from datetime import date, timedelta
+from pathlib import Path
 from typing import Iterable
 
 import numpy as np
@@ -56,6 +58,35 @@ def fetch_prices(
     else:
         prices = raw[["Close"]].rename(columns={"Close": tickers[0]})
     return PriceHistory(prices=prices.dropna(how="all"))
+
+
+def prices_from_json(path: str | Path) -> PriceHistory:
+    """
+    Load a price panel from a JSON file. Used by the cloud routine, which
+    pre-fetches via Robinhood's get_equity_historicals MCP tool (yfinance is
+    blocked at the cloud env's network proxy).
+
+    Expected JSON shape (either is accepted):
+      {"AAPL": {"2026-05-23": 295.0, "2026-05-24": 296.0, ...}, ...}
+      {"AAPL": [{"date": "2026-05-23", "close": 295.0}, ...], ...}
+    """
+    data = json.loads(Path(path).read_text())
+    series: dict[str, pd.Series] = {}
+    for ticker, payload in data.items():
+        if isinstance(payload, dict):
+            s = pd.Series(payload, dtype=float)
+        elif isinstance(payload, list):
+            s = pd.Series(
+                {row["date"]: float(row["close"]) for row in payload if row.get("close") is not None}
+            )
+        else:
+            continue
+        s.index = pd.to_datetime(s.index)
+        series[ticker.upper()] = s
+    if not series:
+        raise ValueError(f"no usable price series in {path}")
+    prices = pd.DataFrame(series).sort_index().dropna(how="all")
+    return PriceHistory(prices=prices)
 
 
 def correlation_matrix(history: PriceHistory, window: int | None = None) -> pd.DataFrame:

@@ -70,8 +70,14 @@ def run(args: argparse.Namespace) -> None:
     universe = build_universe(congress_df) if not congress_df.empty else DEFAULT_UNIVERSE
     log.info("universe size: %d", len(universe))
 
-    log.info("fetching prices...")
-    history = market_data.fetch_prices(universe, lookback_days=args.lookback_days)
+    if args.prices_from_json:
+        log.info("loading prices from %s (bypass yfinance)", args.prices_from_json)
+        history = market_data.prices_from_json(args.prices_from_json)
+        # Restrict universe to whatever prices we got
+        universe = [t for t in universe if t in history.prices.columns]
+    else:
+        log.info("fetching prices via yfinance...")
+        history = market_data.fetch_prices(universe, lookback_days=args.lookback_days)
     log.info("price panel: %s", history.prices.shape)
 
     log.info("market summary (top by sharpe):")
@@ -203,6 +209,7 @@ def main() -> None:
     ap.add_argument("--simulate-buys", type=int, default=0, help="paper-buy top N picks")
     ap.add_argument("--skip-social", action="store_true", help="skip news/social fetch (useful offline)")
     ap.add_argument("--skip-analysts", action="store_true", help="skip yfinance analyst fetch")
+    ap.add_argument("--prices-from-json", default="", help="load price panel from this JSON file instead of yfinance (used when yfinance is network-blocked)")
     ap.add_argument("--social-hours", type=int, default=72, help="lookback window for social mentions")
     ap.add_argument("--live", action="store_true", help="reserved for live Robinhood path (not wired in main)")
     ap.add_argument("--plan", action="store_true", help="emit a trade_plan.json from the ranked candidates")
