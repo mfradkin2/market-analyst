@@ -153,6 +153,19 @@ def run(args: argparse.Namespace) -> None:
             f" last=${row['last']:.2f} upnl=${row['upnl']:+,.2f}"
         )
 
+    # Market regime gate: scale the buy budget by SPY trend. Sells are never gated.
+    regime_scale, regime_note = 1.0, "risk-on"
+    if market_data.SPY in history.prices.columns:
+        spy = history.prices[market_data.SPY].dropna()
+        spy_mom20 = float(spy.iloc[-1] / spy.iloc[-21] - 1) if len(spy) > 21 else 0.0
+        ma_window = min(50, len(spy))
+        spy_ma = float(spy.tail(ma_window).mean())
+        if spy_mom20 <= -0.05:
+            regime_scale, regime_note = 0.0, f"risk-off (SPY 20d {spy_mom20:+.1%}) — no new buys"
+        elif float(spy.iloc[-1]) < spy_ma:
+            regime_scale, regime_note = 0.5, f"caution (SPY below {ma_window}d MA) — half buy budget"
+    log.info("market regime: %s (buy budget x%.1f)", regime_note, regime_scale)
+
     if args.plan:
         positions_payload: dict = {}
         if args.live_positions:
@@ -184,6 +197,7 @@ def run(args: argparse.Namespace) -> None:
             positions=positions_payload,
             intraday_pnl_pct=args.intraday_pnl_pct,
             guardrails=guardrails,
+            regime_scale=regime_scale,
         )
         out_path = Path(args.plan_out)
         plan.write(out_path)

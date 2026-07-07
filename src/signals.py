@@ -45,6 +45,42 @@ def momentum_20d(history: md.PriceHistory) -> pd.Series:
     return (p.iloc[-1] / p.iloc[-21] - 1).dropna()
 
 
+def momentum_window(history: md.PriceHistory, window: int) -> pd.Series | None:
+    """Trailing `window`-day return, or None if the panel is too short."""
+    p = history.prices
+    if len(p) <= window:
+        return None
+    return (p.iloc[-1] / p.iloc[-window - 1] - 1).dropna()
+
+
+def blended_risk_adjusted_momentum(
+    history: md.PriceHistory,
+    vol: pd.Series,
+    short_window: int = 20,
+    long_window: int = 63,
+    short_weight: float = 0.6,
+    vol_floor: float = 0.10,
+) -> pd.Series:
+    """
+    Momentum signal used for ranking: blend of short- and long-window returns,
+    divided by annualized vol.
+
+    Dividing by vol stops the ranker from chasing high-vol spikes (a 67%-vol
+    name up 13% is a weaker signal than a 15%-vol name up 8%). The long window
+    is skipped gracefully when the panel is too short (cloud runs fetch ~3
+    months of dailies).
+    """
+    mom_short = momentum_window(history, short_window)
+    if mom_short is None:
+        raise ValueError(f"price panel too short for {short_window}d momentum")
+    mom_long = momentum_window(history, long_window)
+    if mom_long is not None:
+        blend = short_weight * mom_short + (1 - short_weight) * mom_long.reindex(mom_short.index).fillna(mom_short)
+    else:
+        blend = mom_short
+    return blend / vol.reindex(blend.index).clip(lower=vol_floor)
+
+
 def rank_candidates(
     history: md.PriceHistory,
     congress_signals: pd.DataFrame,
@@ -105,7 +141,8 @@ def rank_candidates(
         {t: md.cluster_momentum(history, t) for t in df.index}
     )
 
-    df["z_mom"] = _zscore(df["momentum_20d"])
+    risk_adj_mom = blended_risk_adjusted_momentum(history, vol).reindex(df.index).fillna(0.0)
+    df["z_mom"] = _zscore(risk_adj_mom)
     df["z_cong"] = _zscore(df["congress_net_dollar"])
     df["z_lowvol"] = -_zscore(df["vol_ann"])
     z_vol_social = _zscore(df["social_volume"])
@@ -117,14 +154,22 @@ def rank_candidates(
     df["z_analyst"] = (z_upside + z_rating + z_upgrades) / 3.0
     df["z_cluster"] = _zscore(df["cluster_momentum"])
 
-    df["score"] = (
-        weight_momentum * df["z_mom"]
-        + weight_congress * df["z_cong"]
-        + weight_social * df["z_social"]
-        + weight_analyst * df["z_analyst"]
-        + weight_cluster * df["z_cluster"]
-        + weight_lowvol * df["z_lowvol"]
-    )
+    # Renormalize weights over ACTIVE components only. In the cloud runs,
+    # congress/social/analyst are often all-zero (no API keys / skipped) —
+    # without renormalization those dead weights silently deflate every score
+    # ~2x, which breaks any absolute score threshold downstream (executor's
+    # min_candidate_score).
+    components = {
+        "z_mom": weight_momentum,
+        "z_cong": weight_congress,
+        "z_social": weight_social,
+        "z_analyst": weight_analyst,
+        "z_cluster": weight_cluster,
+        "z_lowvol": weight_lowvol,
+    }
+    active = {col: w for col, w in components.items() if df[col].abs().max() > 1e-12}
+    total_w = sum(active.values()) or 1.0
+    df["score"] = sum((w / total_w) * df[col] for col, w in active.items())
     df = df.replace([np.inf, -np.inf], np.nan).dropna(subset=["score"])
     df = df.sort_values("score", ascending=False)
 
@@ -181,29 +226,3 @@ def rank_candidates(
     return out
 
 
-def score_for_ticker(candidates: list[Candidate], ticker: str) -> float | None:
-    """Helper: pull the score for a specific ticker (used by sell logic)."""
-    for c in candidates:
-        if c.ticker == ticker:
-            return c.score
-    return None
-
-
-def position_size(
-    candidate: Candidate,
-    portfolio_value: float,
-    risk_per_trade: float = 0.01,
-    stop_loss_pct: float = 0.08,
-) -> int:
-    """
-    Volatility-aware sizing: risk `risk_per_trade` of portfolio per position,
-    assuming a `stop_loss_pct` stop. Returns share count (capped at 25% of book).
-    """
-    if candidate.vol_ann <= 0:
-        return 0
-    dollar_risk = portfolio_value * risk_per_trade
-    per_share_risk = candidate.momentum_20d  # placeholder — caller should pass live price
-    # Caller passes price separately in main; keep this fn focused on dollar sizing.
-    max_dollars = portfolio_value * 0.25
-    risk_dollars = dollar_risk / stop_loss_pct
-    return int(min(max_dollars, risk_dollars))

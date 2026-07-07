@@ -24,12 +24,30 @@ from .signals import Candidate
 log = logging.getLogger(__name__)
 
 
+# Coarse sector buckets for concentration control. Unknown tickers -> "other".
+SECTOR_MAP = {
+    "JPM": "financials", "BAC": "financials", "V": "financials", "MA": "financials",
+    "AAPL": "tech", "MSFT": "tech", "NVDA": "tech", "AMD": "tech", "AVGO": "tech",
+    "CRM": "tech", "ORCL": "tech", "ADBE": "tech",
+    "GOOGL": "communication", "META": "communication", "NFLX": "communication",
+    "SPY": "broad_etf", "QQQ": "broad_etf",
+    "UNH": "healthcare", "LLY": "healthcare",
+    "PG": "staples", "COST": "staples", "WMT": "staples",
+    "HD": "consumer_cyclical", "AMZN": "consumer_cyclical", "TSLA": "consumer_cyclical",
+    "XOM": "energy",
+}
+
+
+def sector_of(ticker: str) -> str:
+    return SECTOR_MAP.get(ticker, "other")
+
+
 @dataclass
 class Guardrails:
     max_position_pct: float = 0.18
     max_total_positions: int = 8
     min_trade_dollars: float = 20.0
-    min_candidate_score: float = 0.0
+    min_candidate_score: float = 0.15
     daily_loss_circuit_breaker_pct: float = -0.03
     limit_price_buffer: float = 0.001  # marketable limit = ask * (1 + buffer)
     whitelist: list[str] = field(default_factory=list)
@@ -44,6 +62,16 @@ class Guardrails:
     # the BUY pass only uses pre-existing buying_power (cash_available), ignoring
     # cash freed by sells in this run. Set False for margin accounts.
     cash_account_t_plus_1: bool = True
+    # Positions below this market value are liquidated outright. Repeated partial
+    # take-profits leave sub-$5 fragments that otherwise sit in the book forever.
+    dust_sweep_dollars: float = 5.0
+    # Volatility-scaled sizing: a candidate's per-position cap is scaled by
+    # target_position_vol / vol_ann (floored at min_vol_scalar), so a 67%-vol
+    # name gets ~1/3 the allocation of a 22%-vol name instead of equal dollars.
+    target_position_vol: float = 0.25
+    min_vol_scalar: float = 0.25
+    # Max fraction of account equity in any one sector bucket (see SECTOR_MAP).
+    sector_cap_pct: float = 0.35
 
 
 @dataclass
@@ -69,6 +97,7 @@ class TradePlan:
     circuit_breaker_tripped: bool
     orders: list[PlannedOrder]
     skipped: list[dict]  # ticker + reason
+    regime_scale: float = 1.0  # 1.0 = full buy budget, 0.5 = caution, 0.0 = risk-off (no buys)
 
     def to_json(self) -> str:
         return json.dumps(
@@ -79,6 +108,7 @@ class TradePlan:
                 "cash_available": self.cash_available,
                 "intraday_pnl_pct": self.intraday_pnl_pct,
                 "circuit_breaker_tripped": self.circuit_breaker_tripped,
+                "regime_scale": self.regime_scale,
                 "orders": [asdict(o) for o in self.orders],
                 "skipped": self.skipped,
             },
@@ -106,6 +136,7 @@ def plan_trades(
     positions: dict[str, dict[str, float]],  # ticker -> {qty, avg_cost, mkt_value}
     intraday_pnl_pct: float,
     guardrails: Guardrails,
+    regime_scale: float = 1.0,
 ) -> TradePlan:
     """
     positions[ticker] = {"qty": float, "avg_cost": float, "mkt_value": float}
@@ -129,6 +160,7 @@ def plan_trades(
             circuit_breaker_tripped=True,
             orders=[],
             skipped=[{"reason": "circuit_breaker", "intraday_pnl_pct": intraday_pnl_pct}],
+            regime_scale=regime_scale,
         )
 
     score_by_ticker = {c.ticker: c.score for c in ranked}
@@ -155,8 +187,12 @@ def plan_trades(
             sell_reason: str | None = None
             sell_fraction: float = 0.0  # 1.0 = full liquidation
 
+            # 0. Dust sweep — fragments left by partial take-profits
+            if mkt_value < guardrails.dust_sweep_dollars:
+                sell_reason = f"dust_sweep (${mkt_value:.2f} < ${guardrails.dust_sweep_dollars:.0f})"
+                sell_fraction = 1.0
             # 1. Signal exit — highest priority
-            if score is not None and score <= guardrails.exit_score_threshold:
+            elif score is not None and score <= guardrails.exit_score_threshold:
                 sell_reason = f"signal_exit (score={score:+.2f})"
                 sell_fraction = 1.0
             # 2. Stop-loss
@@ -221,7 +257,9 @@ def plan_trades(
     # ---- BUY pass ----
     # Cash account: today's sell proceeds settle T+1 and aren't usable for today's buys
     usable_cash = cash_available if guardrails.cash_account_t_plus_1 else cash_available + cash_freed
-    remaining_cash = usable_cash
+    # Regime gate: scale the buy budget by market regime (sells above are never gated)
+    regime_scale = max(0.0, min(1.0, regime_scale))
+    remaining_cash = usable_cash * regime_scale
     open_positions = sum(
         1 for t, p in positions.items()
         if p.get("mkt_value", 0.0) > 0 and not any(
@@ -231,7 +269,27 @@ def plan_trades(
     )
     whitelist = set(guardrails.whitelist) if guardrails.whitelist else None
 
-    for c in ranked:
+    def _fully_sold(t: str) -> bool:
+        return any(
+            o.symbol == t and o.side == "sell"
+            and o.quantity is not None
+            and o.quantity >= positions.get(t, {}).get("qty", 0.0) * 0.999
+            for o in orders
+        )
+
+    # Current sector exposure from surviving positions (full sells excluded;
+    # partial sells ignored, which errs conservative on concentration).
+    sector_exposure: dict[str, float] = {}
+    for t, p in positions.items():
+        if p.get("mkt_value", 0.0) <= 0 or _fully_sold(t):
+            continue
+        sec = sector_of(t)
+        sector_exposure[sec] = sector_exposure.get(sec, 0.0) + p["mkt_value"]
+
+    if regime_scale <= 0.0:
+        skipped.append({"reason": "regime_gate", "regime_scale": regime_scale})
+
+    for c in ranked if regime_scale > 0.0 else []:
         if open_positions + sum(1 for o in orders if o.side == "buy" and o.symbol not in positions) >= guardrails.max_total_positions:
             skipped.append({"ticker": c.ticker, "reason": "max_positions_reached"})
             continue
@@ -247,21 +305,29 @@ def plan_trades(
 
         already_in = positions.get(c.ticker, {}).get("mkt_value", 0.0)
         # If we sold this ticker fully in the sell pass, treat as empty
-        full_sold = any(
-            o.symbol == c.ticker and o.side == "sell"
-            and o.quantity is not None
-            and o.quantity >= positions.get(c.ticker, {}).get("qty", 0.0) * 0.999
-            for o in orders
-        )
-        if full_sold:
+        if _fully_sold(c.ticker):
             already_in = 0.0
-        headroom = max(0.0, max_dollars_per_position - already_in)
-        target_dollars = min(headroom, remaining_cash)
+
+        # Volatility-scaled per-position cap: high-vol names get proportionally
+        # smaller allocations instead of the same dollars as low-vol names.
+        vol_scalar = 1.0
+        if c.vol_ann and guardrails.target_position_vol > 0 and c.vol_ann > guardrails.target_position_vol:
+            vol_scalar = max(guardrails.min_vol_scalar, guardrails.target_position_vol / c.vol_ann)
+        effective_cap = max_dollars_per_position * vol_scalar
+        headroom = max(0.0, effective_cap - already_in)
+
+        # Sector concentration cap
+        sec = sector_of(c.ticker)
+        sector_room = max(0.0, guardrails.sector_cap_pct * account_equity - sector_exposure.get(sec, 0.0))
+
+        target_dollars = min(headroom, remaining_cash, sector_room)
         if target_dollars < guardrails.min_trade_dollars:
-            reason = (
-                "position_full" if headroom < guardrails.min_trade_dollars
-                else f"insufficient_cash (${remaining_cash:.2f} < ${guardrails.min_trade_dollars:.2f})"
-            )
+            if headroom < guardrails.min_trade_dollars:
+                reason = "position_full"
+            elif sector_room < guardrails.min_trade_dollars:
+                reason = f"sector_cap ({sec} at ${sector_exposure.get(sec, 0.0):.0f})"
+            else:
+                reason = f"insufficient_cash (${remaining_cash:.2f} < ${guardrails.min_trade_dollars:.2f})"
             skipped.append({"ticker": c.ticker, "reason": reason})
             continue
 
@@ -285,6 +351,7 @@ def plan_trades(
             )
         )
         remaining_cash -= target_dollars
+        sector_exposure[sec] = sector_exposure.get(sec, 0.0) + target_dollars
         if c.ticker not in positions:
             open_positions += 1
 
@@ -297,4 +364,5 @@ def plan_trades(
         circuit_breaker_tripped=False,
         orders=orders,
         skipped=skipped,
+        regime_scale=regime_scale,
     )
